@@ -147,6 +147,26 @@ init(Value)
 when is_integer(Value), Value>0 ->
     {ok, #state{value = Value}}.
 
+%%
+%% @private
+%%
+%% Helper function that notifies a waiting process to continue (if one exists)
+%% or increase the semaphore value. It uses the current State to determinte
+%% which action to perform and returns the result NewState.
+%%
+-spec notify_or_increase_value(State::#state{}) -> NewState::#state{}.
+
+notify_or_increase_value(#state{value=Value, users=Users, waiters=Waiters}=State) ->
+    case Waiters of
+        [] ->
+            State#state{value=Value+1};
+        [{WaitingProc, _WaitProcMon, CallingProc} | RemainingWaiters] -> 
+            WaitingProc ! acquired,
+            NewUser = {CallingProc, erlang:monitor(process, CallingProc)},
+            State#state{users=[NewUser | Users], waiters=RemainingWaiters}
+    end.        
+
+
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
@@ -202,22 +222,15 @@ handle_call({timed_wait, _}, {CallingPid, _}, #state{value=Value, users=Users}=S
     },
     {reply, ok, NewState};
 
-handle_call(post, {CallingPid, _}, #state{value=Value, users=Users, waiters=Waiters}=State) ->
+handle_call(post, {CallingPid, _}, #state{value=Value, users=Users}=State) ->
     ?debug_log("post: beginning state ~p~n", [State]),
     % Only processes in the Users list can do a post
     Result =
     case lists:keytake(CallingPid, 1, Users) of
         {value, {CallingPid, MonRef}, RemainingUsers} ->
             true = demonitor(MonRef, [flush]),
-            % Notify waiting process OR increase value
-            case Waiters of
-                [{WaitingProc, _WaitProcMon, CallingProc} | RemainingWaiters] -> % notify waiter
-                    WaitingProc ! acquired,
-                    NewUser = {CallingProc, erlang:monitor(process, CallingProc)},
-                    {reply, ok, State#state{users=[NewUser | RemainingUsers], waiters=RemainingWaiters}};
-                [] ->
-                    {reply, ok, State#state{users=RemainingUsers, value=Value+1}}
-            end;        
+            NewState = notify_or_increase_value(State#state{users=RemainingUsers}),
+            {reply, ok, NewState};        
         false ->
             {reply, error, State}
     end,
@@ -230,6 +243,7 @@ handle_call(get_value, _, #state{value=Value}=State) ->
 handle_call(Request, _From, State) ->
     ?debug_log("Unknown call: ~p~n", [Request]),
     {reply, unknown, State}.
+
 
 %%--------------------------------------------------------------------
 %% @private
@@ -256,7 +270,7 @@ handle_cast(Msg, State) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_info({'DOWN', MonRef, process, Pid, _DownInfo}=Info, 
-            #state{value=Value, users=Users, waiters=Waiters}=State) ->
+            #state{users=Users, waiters=Waiters}=State) ->
     ?debug_log("handle_info: beginning ~p~n~p~n", [Info, State]),
     % We always remove the monitor
     true = demonitor(MonRef, [flush]),
@@ -270,14 +284,7 @@ handle_info({'DOWN', MonRef, process, Pid, _DownInfo}=Info,
             case lists:keytake(MonRef, 2, Users) of
                 {value, {Pid, MonRef}, RemainingUsers} ->
                     % If a user process died without doing a POST, we need to bump the value or notify a waiting process
-                    case Waiters of
-                        [{WaitingProc, _WaitProcMon, CallingProc} | RemainingWaiters] -> % notify waiter
-                            WaitingProc ! acquired,
-                            NewUser = {CallingProc, erlang:monitor(process, CallingProc)},
-                            State#state{users=[NewUser | RemainingUsers], waiters=RemainingWaiters};
-                        [] ->
-                            State#state{users=RemainingUsers, value=Value+1}
-                    end;
+                    notify_or_increase_value(State#state{users=RemainingUsers});
                 false ->
                     % It is possible that the process associated with the monitor event
                     % was already removed from the Waiters list. In this case we 
