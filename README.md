@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/cobusc/erlang_semaphore.png?branch=master)](https://www.travis-ci.org/cobusc/erlang_semaphore)
+
 semaphore
 =========
 
