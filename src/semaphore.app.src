@@ -1,0 +1,8 @@
+{application, semaphore,
+ [{description, "Semaphore"},
+  {vsn, "1.0.0"},
+  {modules, [semaphore]},
+  {registered, []},
+  {applications, []},
+  {included_applications, []}
+ ]}.
