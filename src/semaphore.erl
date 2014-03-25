@@ -17,13 +17,11 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/2,
+-export([start_link/2,                      % Initialisation
 
-         wait/1,
-         try_wait/1,
-         timed_wait/2,
-
-         post/1
+         wait/1, try_wait/1, timed_wait/2,  % Acquisition
+         post/1,                            % Release
+         get_value/1                        % Inspection
         ]).
 
 %% gen_server callbacks
@@ -34,28 +32,36 @@
          terminate/2,
          code_change/3]).
 
--type waiter() :: { WaitProcPid::pid(),
-                    WaitProcMonRef::reference(),
-                    CallingProcPid::pid()
-                  }.
+-type waiter() :: { 
+    WaitProcPid::pid(),
+    WaitProcMonRef::reference(),
+    CallingProcPid::pid()
+}.
 
 -type waiters() :: list(waiter()).
 
--type user() :: { UserProcPid::pid(),
-                  UserProcMonRef::reference()
-                }.
+-type user() :: { 
+    UserProcPid::pid(),
+    UserProcMonRef::reference()
+}.
 
 -type users() :: list(user()).
 
 
 -record(state, 
 {
-    balance = 0 :: non_neg_integer(),
-    waiters = [] :: waiters(), % Processes waiting to acquire the semaphore
-    users = [] :: users()      % Processes using the semaphore
+    value = 0 :: non_neg_integer(), % The semaphore value
+    waiters = [] :: waiters(),      % Processes waiting to acquire the semaphore
+    users = [] :: users()           % Processes using the semaphore
 }).
 
 -define(GLOBAL_NAME(X), {global, {?MODULE, X}}).
+
+-ifdef(FOOBAR).
+-define(debug_log(Format, Args), error_logger:info_msg(Format, Args)).
+-else.
+-define(debug_log(_A, _B), ok).
+-endif.
 
 %%%===================================================================
 %%% API
@@ -102,6 +108,14 @@ timed_wait(Name, Timeout) ->
 post(Name) ->
     gen_server:call(?GLOBAL_NAME(Name), post, infinity).
 
+%%
+%% @doc Returns the value of the semaphore
+%%
+-spec get_value(Name::atom()) -> non_neg_integer().
+
+get_value(Name) ->
+    gen_server:call(?GLOBAL_NAME(Name), get_value, infinity).
+
 %%--------------------------------------------------------------------
 %% @doc
 %% Starts the server
@@ -109,8 +123,8 @@ post(Name) ->
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link(Name, Balance) ->
-    gen_server:start_link(?GLOBAL_NAME(Name), ?MODULE, Balance, []).
+start_link(Name, Value) ->
+    gen_server:start_link(?GLOBAL_NAME(Name), ?MODULE, Value, []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -127,11 +141,11 @@ start_link(Name, Balance) ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
--spec init(Balance::pos_integer()) -> {ok, State::#state{}}.
+-spec init(Value::pos_integer()) -> {ok, State::#state{}}.
 
-init(Balance)
-when is_integer(Balance), Balance>0 ->
-    {ok, #state{balance = Balance}}.
+init(Value)
+when is_integer(Value), Value>0 ->
+    {ok, #state{value = Value}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -147,18 +161,21 @@ when is_integer(Balance), Balance>0 ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call(try_wait, _, #state{balance=0}=State) ->
+handle_call(try_wait, _, #state{value=0}=State) ->
+    ?debug_log("try_wait with value 0~n", []),
     {reply, error, State};
 
-handle_call(try_wait, {CallingPid, _}, #state{balance=Balance, users=Users}=State) ->
+handle_call(try_wait, {CallingPid, _}, #state{value=Value, users=Users}=State) ->
+    ?debug_log("try_wait with value ~B~n", [Value]),
     MonRef = erlang:monitor(process, CallingPid),
     NewState = State#state{
-        balance = Balance-1,
+        value = Value-1,
         users = [{CallingPid, MonRef} | Users]
     },
     {reply, ok, NewState};
 
-handle_call({timed_wait, TimeoutMs}, {CallingPid, _}, #state{balance=0, waiters=Waiters}=State) ->
+handle_call({timed_wait, TimeoutMs}, {CallingPid, _}=From, #state{value=0, waiters=Waiters}=State) ->
+    ?debug_log("timed_wait with value 0, timeout ~B~n", [TimeoutMs]),
     %% Block until semaphore increases above 0
     Fun = 
     fun () ->
@@ -169,40 +186,49 @@ handle_call({timed_wait, TimeoutMs}, {CallingPid, _}, #state{balance=0, waiters=
         after TimeoutMs ->
             {error, timeout}
         end,
-        gen_server:reply(CallingPid, Result)
+        gen_server:reply(From, Result)
     end,
 
     {WaitingPid, WaitingMonRef} = spawn_monitor(Fun),
     NewState = State#state{waiters=[{WaitingPid, WaitingMonRef, CallingPid} | Waiters]},
     {noreply, NewState};
 
-handle_call({timed_wait, _}, {CallingPid, _}, #state{balance=Balance, users=Users}=State) ->
+handle_call({timed_wait, _}, {CallingPid, _}, #state{value=Value, users=Users}=State) ->
+    ?debug_log("timed_wait with value ~B~n", [Value]),
     MonRef = erlang:monitor(process, CallingPid),
     NewState = State#state{
-        balance = Balance-1, 
+        value = Value-1, 
         users = [{CallingPid, MonRef} | Users]
     },
     {reply, ok, NewState};
 
-handle_call(post, {CallingPid, _}, #state{balance=Balance, users=Users, waiters=Waiters}=State) ->
+handle_call(post, {CallingPid, _}, #state{value=Value, users=Users, waiters=Waiters}=State) ->
+    ?debug_log("post: beginning state ~p~n", [State]),
     % Only processes in the Users list can do a post
+    Result =
     case lists:keytake(CallingPid, 1, Users) of
         {value, {CallingPid, MonRef}, RemainingUsers} ->
             true = demonitor(MonRef, [flush]),
-            % Notify waiting process OR increase balance
+            % Notify waiting process OR increase value
             case Waiters of
                 [{WaitingProc, _WaitProcMon, CallingProc} | RemainingWaiters] -> % notify waiter
                     WaitingProc ! acquired,
                     NewUser = {CallingProc, erlang:monitor(process, CallingProc)},
                     {reply, ok, State#state{users=[NewUser | RemainingUsers], waiters=RemainingWaiters}};
                 [] ->
-                    {reply, ok, State#state{users=RemainingUsers, balance=Balance+1}}
+                    {reply, ok, State#state{users=RemainingUsers, value=Value+1}}
             end;        
         false ->
             {reply, error, State}
-    end;
+    end,
+    ?debug_log("post: result ~p~n", [Result]),
+    Result;
 
-handle_call(_Request, _From, State) ->
+handle_call(get_value, _, #state{value=Value}=State) ->
+    {reply, Value, State};
+
+handle_call(Request, _From, State) ->
+    ?debug_log("Unknown call: ~p~n", [Request]),
     {reply, unknown, State}.
 
 %%--------------------------------------------------------------------
@@ -215,7 +241,8 @@ handle_call(_Request, _From, State) ->
 %%                                  {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_cast(_Msg, State) ->
+handle_cast(Msg, State) ->
+    ?debug_log("handle_cast: ~p~n", [Msg]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -228,21 +255,29 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info({'DOWN', MonRef, process, Pid, _Info}, 
-            #state{balance=Balance, users=Users, waiters=Waiters}=State) ->
+handle_info({'DOWN', MonRef, process, Pid, _DownInfo}=Info, 
+            #state{value=Value, users=Users, waiters=Waiters}=State) ->
+    ?debug_log("handle_info: beginning ~p~n~p~n", [Info, State]),
     % We always remove the monitor
     true = demonitor(MonRef, [flush]),
 
     NewState = 
     case lists:keytake(MonRef, 2, Waiters) of
-        {value, {Pid, MonRef}, RemainingWaiters} ->
+        {value, {Pid, MonRef, _CallerPid}, RemainingWaiters} ->
             % Process not waiting anymore
             State#state{waiters=RemainingWaiters};
         false ->
             case lists:keytake(MonRef, 2, Users) of
                 {value, {Pid, MonRef}, RemainingUsers} ->
-                    % User process died without doing a POST. We need to bump the balance.
-                    State#state{balance=Balance+1, users=RemainingUsers};
+                    % If a user process died without doing a POST, we need to bump the value or notify a waiting process
+                    case Waiters of
+                        [{WaitingProc, _WaitProcMon, CallingProc} | RemainingWaiters] -> % notify waiter
+                            WaitingProc ! acquired,
+                            NewUser = {CallingProc, erlang:monitor(process, CallingProc)},
+                            State#state{users=[NewUser | RemainingUsers], waiters=RemainingWaiters};
+                        [] ->
+                            State#state{users=RemainingUsers, value=Value+1}
+                    end;
                 false ->
                     % It is possible that the process associated with the monitor event
                     % was already removed from the Waiters list. In this case we 
@@ -250,9 +285,11 @@ handle_info({'DOWN', MonRef, process, Pid, _Info},
                     State
             end
     end,
+    ?debug_log("debug_info: new state ~p~n", [NewState]),
     {noreply, NewState};
 
-handle_info(_Info, State) ->
+handle_info(Info, State) ->
+    ?debug_log("Unknown info: ~p~n", [Info]),
     {noreply, State}.
 
 %%--------------------------------------------------------------------
@@ -266,8 +303,10 @@ handle_info(_Info, State) ->
 %% @spec terminate(Reason, State) -> void()
 %% @end
 %%--------------------------------------------------------------------
-terminate(_Reason, _State) ->
-    ok.
+terminate(_Reason, #state{users=Users, waiters=Waiters}) ->
+    Monitors = [ UMonRef || {_, UMonRef} <- Users ] ++ [ WMonRef || {_, WMonRef, _} <- Waiters ],
+    lists:foreach(fun demonitor/1, Monitors).
+    
 
 %%--------------------------------------------------------------------
 %% @private
@@ -280,6 +319,3 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
